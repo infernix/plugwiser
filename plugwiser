@@ -1,0 +1,463 @@
+#!/usr/bin/env python
+
+# Plugwiser v1.0 - infernix@infernix.net
+#
+# An adaptation of plugwise_util from python-plugwise
+#
+# python-plugwise code by Sven Petai <hadara@bsd.ee> https://bitbucket.org/hadara/python-plugwise/wiki/Home
+# Various submission code taken from ecmread http://lancet.mit.edu/~mwall/projects/power/
+
+# YOU NEED TO BUILD python-plugwise BEFORE THIS WILL EVEN WORK.
+# Also take care of other required imports.
+
+# For help, run plugwiser -h
+# Once working, can be ran in cron every minute (or more often) with the desired flags for API submission. Also see -b option.
+
+### Settings go here
+
+# Lock file
+LOCKFILE = "/var/lock/plugwiser"
+
+# Serial port for Plugwise USB stick
+DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
+
+# Array of (full length) Plugwise MACs and their description
+# Needs to be fully populated, e.g. 'MAC', 'Description'
+# Don't use whitespaces in the description, not all services support it.
+PLUGWISE_CIRCLES = [
+['000D6F0000123456', 'MyOldCirclePlus'],
+['000D6F0002345678', 'MyNewCircle'],
+['000D6F0000987654', 'MyLastCircle']]
+
+# Pachube/cosm "just works" - just fill in the API key, ids are auto-created on submission 
+COSM_API_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+COSM_FEED_ID = '12345'
+
+# Smartenergygroups is well supported and probably has the nicest features of all current supported APIs.
+# You need to create a site, then add a device to it.
+# Device type: Energy Meter
+# Device node name: plugwise
+# After that you must create streams for every plug in your PLUGWISE_CIRCLES list.
+# Create two steams for each plug:
+# - one for 'my type of data: Power, W' where 'stream name' is the description of your circle in PLUGWISE_CIRCLES
+# - one for 'my type of data: Energy, Wh' where 'stream name' is the description of your circle in PLUGWISE_CIRCLES suffixed with _wh
+# Example: if you call a plug Refrigerator, create one stream for Power, W with stream name 'refrigerator' and another for Energy, Wh with stream name 'refrigerator_wh'
+SEG_URL = 'http://api.smartenergygroups.com/api_sites/stream'
+SEG_TOKEN = 'abc123def456ghi'
+
+# Open energy monitor settings
+# This also works "as is" - W and Wh values are submitted and can be configured in the Inputs screen
+OEM_URL = 'http://my.own.server.tld/emoncms3/api/post'
+OEM_API_KEY = '123abc456def789ghi012jkl345mno67'
+
+# Plottwatt submisssion works, but I have been unable to get it to generate useful data.
+PLOTWATT_API_KEY       = 'abcdefghijklmnop'
+PLOTWATT_HOUSE_ID      = 1234
+# for plotwatt we need to map created meters to circles.
+# We use the index number from the PLUGWISE_CIRCLES list to map them so it's just a simple list of numbers. For more info see the PlotWatt API docs.
+PLOTWATT_MAP = [ '12345', '12346', '12347']
+
+### End of settings
+
+# general import
+import sys
+import logging
+import fcntl
+import os
+
+# options import
+#from pprint import pprint
+import optparse
+
+# plugwise imports
+from serial.serialutil import SerialException
+from plugwise import *
+import plugwise.util
+from datetime import timedelta
+
+# cosm/pachube imports
+import mechanize
+import json
+import time
+
+# plotwatt imports
+import urllib2, base64
+from datetime import datetime
+import time
+import json
+
+# cosm/pachube class definition
+class PachubeFeedUpdate:
+
+  _url_base = "http://api.pachube.com/v2/feeds/"
+  _feed_id = None
+  _version = None
+  ## the substance of our update - list of dictionaries with keys 'id' and 'current_value'
+  _data = None
+  ## the actual object we'll JSONify and send to the API endpoint
+  _payload = None
+  _opener = None
+
+  def __init__(self, feed_id, apikey):
+    self._version = "1.0.0"
+    self._feed_id = feed_id
+    self._opener = mechanize.build_opener()
+    self._opener.addheaders = [('X-PachubeApiKey',apikey)]
+    self._data = []
+    self._payload = {}
+
+  def addDatapoint(self,dp_id,dp_value):
+    self._data.append({'id':dp_id, 'current_value':dp_value})
+
+  def buildUpdate(self):
+    self._payload['version'] = self._version
+    self._payload['id'] = self._feed_id
+    self._payload['datastreams'] = self._data
+
+  def sendUpdate(self):
+    url = self._url_base + self._feed_id + "?_method=put"
+    try:
+      self._opener.open(url,json.dumps(self._payload))
+    except mechanize.HTTPError as e:
+      logging.info("An HTTP error occurred while submitting to plugwise")
+
+# Plotwatt classes
+class PlotwattError :
+    def __init__(self, raw_json) :
+        o = json.loads(raw_json)
+        self.entity = o['entity']
+        self.error  = o['error']
+    
+    def __str__(self) :
+        logger.info("Plotwatt Error: %s - entity: %s" % (self.error, self.entity))
+
+class Plotwatt():
+    def __init__(self, house_id, secret, baseurl="http://plotwatt.com") :
+        self.house_id = PLOTWATT_HOUSE_ID
+        self.secret   = PLOTWATT_API_KEY
+        
+        self.baseurl = baseurl
+        self.base64string = base64.encodestring('%s:%s' % (secret, ''))[:-1]
+        self.authheader =  "Basic %s" % self.base64string
+
+        self.mysql_datetime_format = "'%Y-%m-%d %H:%M:%S'"
+
+        # api actions
+        self.list_meters_url = '/api/v2/list_meters'
+        self.push_readings_url = '/api/v2/push_readings'
+        self.new_meters_url = '/api/v2/new_meters'
+        self.delete_meter_url = '/api/v2/delete_meter'
+
+    def _request(self, url, data=None):
+        """ make a request to plotwatt.com """
+        req = urllib2.Request(self.baseurl + url)
+        req.add_header("Authorization", self.authheader)
+        try :
+            return urllib2.urlopen(req, data, 5)
+        except urllib2.HTTPError, e :
+            if e.code == 422 :
+                raise PlotwattError(e.read())
+            raise e
+
+    def create_meters(self, num_meters):
+        """ create meters on your plotwatt.com account """
+        res = self._request(self.new_meters_url, "number_of_new_meters=%s" % num_meters)
+        return json.loads(res.read())
+
+    def delete_meter(self, meter_id):
+        """ delete a meter from your plotwatt.com account """
+        return self._request(self.delete_meter_url, "meter_id=%s" % meter_id)
+
+    def list_meters(self):
+        """ list the meters connected to your plotwatt.com account """
+        res = self._request(self.list_meters_url, '')
+        return eval(res.read())
+
+    def push_readings(self, meter, readings, times):
+        """call push_readings endpoint. times should be in POSIX format in UTC"""
+        
+        meters = [meter] * len(readings)
+        
+        def sanitize_times(t) :
+          """ if the input is a datetime, turn it into a timestamp, otherwise,
+          make sure that it is an intiger """
+          if isinstance(t, datetime) :
+            return str(int(time.mktime(t.timetuple())))
+          else :
+            return str(int(t))
+          
+        times = map(sanitize_times, times)
+        data = ','.join(map(lambda (m,r,t): "%s,%s,%s" % (m,r,t), zip(meters, readings, times)))
+        res = self._request(self.push_readings_url, data)
+        assert res.getcode() == 200
+        return res
+
+# openenergymonotir class
+class OEMUpdate:
+
+  _url_base = OEM_URL
+  _api_key = OEM_API_KEY
+  ## the substance of our update - list of dictionaries with keys 'id' and 'current_value'
+  _data = None
+  ## the actual object we'll JSONify and send to the API endpoint
+  _payload = None
+  _opener = None
+
+  def __init__(self, apikey):
+    self._opener = mechanize.build_opener()
+    self._data = []
+    self._payload = {}
+
+  def addDatapoint(self,dp_id,dp_value):
+    self._data.append(dp_id + ':' + dp_value + ',')
+
+  def buildUpdate(self):
+    self._payload['datastreams'] = self._data
+
+  def sendUpdate(self):
+    url = self._url_base + '?apikey=' + self._api_key + '&json={' + "".join(self._data) + '}'
+    try:
+      self._opener.open(url)
+    except mechanize.HTTPError as e:
+      logging.error("An HTTP error occurred while submitting to OpenEnergyMonitor: %s" % e)
+
+# SEG class
+class SEGUpdate:
+
+  _url_base = SEG_URL
+  _api_key = SEG_TOKEN
+  ## the substance of our update - list of dictionaries with keys 'id' and 'current_value'
+  _data = None
+  ## the actual object we'll JSONify and send to the API endpoint
+  _payload = None
+  _opener = None
+
+  def __init__(self, apikey):
+    self._opener = urllib2.build_opener(urllib2.HTTPHandler)
+    self._data = []
+    self._payload = {}
+
+  def addDatapoint(self,dp_id,dp_value):
+    self._data.append('(%s %s)' % (dp_id.lower(), dp_value))
+
+  def buildUpdate(self):
+    self._payload['datastreams'] = self._data
+
+  def sendUpdate(self):
+    your_put_data = '(site ' + self._api_key + ' (node plugwise ? ' + "".join(self._data) + ')'
+    request = urllib2.Request(self._url_base, data=your_put_data)
+    #request.add_header('Content-Type', 'your/contenttype')
+    request.get_method = lambda: 'PUT'
+    try:
+      self._opener.open(request)
+    except mechanize.HTTPError as e:
+      logging.error("An HTTP error occurred while submitting to SmartEnergyGroups: %s" % e)
+
+# SEG class
+class SEGUpdateWh:
+
+  _url_base = SEG_URL
+  _api_key = SEG_TOKEN
+  ## the substance of our update - list of dictionaries with keys 'id' and 'current_value'
+  _data = None
+  ## the actual object we'll JSONify and send to the API endpoint
+  _payload = None
+  _opener = None
+
+  def __init__(self, apikey):
+    self._opener = urllib2.build_opener(urllib2.HTTPHandler)
+    self._data = []
+    self._payload = {}
+
+  def addDatapoint(self,dp_id,dp_value):
+    self._data.append('(%s %s)' % (dp_id.lower(), dp_value))
+
+  def buildUpdate(self):
+    self._payload['datastreams'] = self._data
+
+  # for wh updats, we have to send lasthour datetime at like xx:55 in UTC
+  # FIXME: still need to see what the appropriate submission time is, xx:55 is just a guess
+  def sendUpdate(self):
+    thishourutc = datetime.utcnow()
+    lasthourutc = thishourutc - timedelta(hours=1)
+    submitdate = lasthourutc.strftime("%Y-%m-%dT%H:55:00")
+    your_put_data = '(site ' + self._api_key + ' (node plugwise ' + submitdate + ' ' + " ".join(self._data) + ')'
+    request = urllib2.Request(self._url_base, data=your_put_data)
+    #request.add_header('Content-Type', 'your/contenttype')
+    request.get_method = lambda: 'PUT'
+    try:
+      self._opener.open(request)
+    except mechanize.HTTPError as e:
+      logging.error("An HTTP error occurred while submitting to SmartEnergyGroups: %s" % e)
+
+# locking code
+def lockFile(lockfile):
+	fd = os.open(lockfile, os.O_CREAT | os.O_TRUNC | os.O_WRONLY)
+	try:
+		#Request exclusive (EX) non-blocking (NB) advisory lock.
+		fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except IOError:
+		return False
+
+	return True
+
+
+# parse commandline options
+parser = optparse.OptionParser()
+parser.add_option("-d", "--debug", action="store_true",  dest="debug",
+    help="""Debug mode.""")
+parser.add_option("-q", "--quiet", action="store_true", dest="quiet",
+    help="""Quiet mode, only print errors. Useful in cron jobs.""")
+parser.add_option("-c", "--cosm", action="store_true", dest="cosm",
+    help="""Submit power values to Cosm/Pachube.""")
+parser.add_option("-p", "--plotwatt", action="store_true", dest="plotwatt",
+    help="""Submit power values to Plotwatt.""")
+parser.add_option("-o", "--openenergymonitor", action="store_true", dest="oem",
+    help="""Submit power values to OpenEnergyMonitor.""")
+parser.add_option("-s", "--smartenergygroups", action="store_true", dest="seg",
+    help="""Submit power values to SmartEnergyGroups.""")
+parser.add_option("-b", "--blind", action="store_true", dest="blind",
+    help="""Blind mode, never output anything. Useful in cron jobs but not recommended.""")
+parser.add_option("-t", "--timesync", action="store_true", dest="timesync",
+    help="""Sync Circle's internal clock to current local time on this server.""")
+
+options, args = parser.parse_args()
+
+# set default device
+device = DEFAULT_SERIAL_PORT
+
+# set standard logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+# set debug if verbmse option is passed
+if options.debug:
+    plugwise.util.DEBUG_PROTOCOL = True
+    logging.getLogger().setLevel(logging.DEBUG)
+
+# Only print errors if quiet option is passed
+if options.quiet:
+    logging.getLogger().setLevel(logging.ERROR)
+
+# Never print out anything.
+if options.blind:
+    logging.getLogger().setLevel(logging.CRITICAL)
+
+
+# Make sure we're not running already
+
+if not lockFile(LOCKFILE):
+	logging.error("Error: already running, lock file %s exists" % (LOCKFILE,))
+        sys.exit(1)
+
+# connect to the plugwise stick, or fail with an error
+try:
+    logging.debug("Connecting to plugwise stick on %s" % device)
+    device = Stick(device)
+    logging.info("Connected to Plugwise stick")
+except (TimeoutException, SerialException) as reason:
+    logging.error("Error: %s" % (reason,))
+    sys.exit(1)
+
+# Create the cosm datapoint update
+cosmfeedupdate = PachubeFeedUpdate(COSM_FEED_ID, COSM_API_KEY)
+
+# Create the OEM datapoint update
+oemfeedupdate = OEMUpdate(OEM_API_KEY)
+
+# Create the SEG datapoint update
+segfeedupdate = SEGUpdate(SEG_TOKEN)
+segfeedupdatewh = SEGUpdateWh(SEG_TOKEN)
+
+# go over each circle and store its current power value inside the array if we get a valid readout
+for circle in PLUGWISE_CIRCLES:
+    mac = circle[0]
+    description = circle[1]
+    index = PLUGWISE_CIRCLES.index(circle)
+    try:
+
+	# Sync time first if we're asked to do so
+	if options.timesync:
+		Circle(mac, device).set_clock(datetime.now())
+	# Next, retrieve power values
+	power = '%.2f' % Circle(mac, device).get_power_usage()
+	# add the value to the list
+	circle.insert(2, power)
+	# Now retrieve last hours' Wh value
+	# We need to pull in both the current log address and the previous one
+	last_logaddr = Circle(mac, device).get_info()['last_logaddr']
+	whlast = 'Unknown'
+	whlasttime = 'Unknown'
+	wharraycur = Circle(mac, device).get_power_usage_history(last_logaddr)
+	wharrayprev = Circle(mac, device).get_power_usage_history(last_logaddr-1)
+	wharray = wharrayprev + wharraycur
+	for circletimestamp, watt_hours in wharray:
+		if circletimestamp is not None:
+		        thishour = datetime.now()
+			# FIXME: Not sure if this needs the - timedelta(hours=1) or not. 
+			# I think it depends on when the time is set on the circles
+			# lasthour = thishour - timedelta(hours=1)
+			lasthour = thishour
+			lasthourcomp = lasthour.strftime("%Y-%m-%d %H")
+			circletime = circletimestamp.strftime("%Y-%m-%d %H")
+			watthours = "%.2f" % (watt_hours)
+	    		logging.debug("lasthourcomp %s, circletime %s, watthours %s" % (lasthourcomp, circletime, watthours))
+			if lasthourcomp == circletime:
+				whlast = watthours
+				whlasttime = circletime
+	circle.insert(3,whlast)
+	# add the raw power value to the update datapoints
+	cosmfeedupdate.addDatapoint(description,power)
+	oemfeedupdate.addDatapoint(description,power)
+	segfeedupdate.addDatapoint(description,power)
+	# also submit Wh data if we have it
+	if whlast != 'Unknown':
+		segfeedupdatewh.addDatapoint(description + '_wh',whlast)
+		cosmfeedupdate.addDatapoint(description + '_wh',whlast)
+		oemfeedupdate.addDatapoint(description + '_wh',whlast)
+    except ValueError:
+	power = 'Unknown'
+    except TimeoutException:
+	power = 'Timeout'
+    logging.info("Circle %s: %s (%s): %s - last Wh %s @ %s" % (index, mac, description, power, whlast, whlasttime))
+else:
+    logging.debug("Parsed all configured circles")
+
+# Now lets's submit to the various webservices
+
+# Cosm/pachube:
+if options.cosm:
+	cosmfeedupdate.buildUpdate()
+	cosmfeedupdate.sendUpdate()
+	logging.info("Submitted values to Cosm")
+
+# openenergymonitor
+if options.oem:
+	oemfeedupdate.buildUpdate()
+	oemfeedupdate.sendUpdate()
+	logging.info("Submitted values to OpenEnergyMonitor")
+
+# smartenergygroups
+if options.seg:
+	segfeedupdate.buildUpdate()
+	segfeedupdate.sendUpdate()
+	segfeedupdatewh.buildUpdate()
+	segfeedupdatewh.sendUpdate()
+	logging.info("Submitted values to SmartEnergyGroups")
+
+# plotwatt, one submit per meter
+if options.plotwatt:
+	pw = Plotwatt(PLOTWATT_HOUSE_ID, PLOTWATT_API_KEY)
+	now = datetime.now()
+	for circle in PLUGWISE_CIRCLES:
+		index = PLUGWISE_CIRCLES.index(circle)
+    		description = circle[1]
+		try:
+			power = circle[2]
+			meter_id = PLOTWATT_MAP[index]
+			logging.debug("Meter %s, value %s, time %s" % (meter_id, power, now))
+			pw.push_readings(meter_id, [power], [now])
+		except IndexError:
+			logging.info("No value for %s" % description)
+	logging.info("Submitted values to Plotwatt")
+
+logging.debug("End of program.")
