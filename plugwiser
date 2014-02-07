@@ -29,9 +29,9 @@ PLUGWISE_CIRCLES = [
 ['000D6F0002345678', 'MyNewCircle'],
 ['000D6F0000987654', 'MyLastCircle']]
 
-# Pachube/cosm "just works" - just fill in the API key, ids are auto-created on submission 
-COSM_API_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
-COSM_FEED_ID = '12345'
+# Xively "just works" - just fill in the API key, ids are auto-created on submission 
+XIVELY_API_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+XIVELY_FEED_ID = '12345'
 
 # Smartenergygroups is well supported and probably has the nicest features of all current supported APIs.
 # You need to create a site, then add a device to it.
@@ -75,7 +75,7 @@ from plugwise import *
 import plugwise.util
 from datetime import timedelta
 
-# cosm/pachube imports
+# xively imports
 import mechanize
 import json
 import time
@@ -86,10 +86,10 @@ from datetime import datetime
 import time
 import json
 
-# cosm/pachube class definition
-class PachubeFeedUpdate:
+# xively class definition
+class XivelyFeedUpdate:
 
-  _url_base = "http://api.pachube.com/v2/feeds/"
+  _url_base = "http://api.xively.com/v2/feeds/"
   _feed_id = None
   _version = None
   ## the substance of our update - list of dictionaries with keys 'id' and 'current_value'
@@ -102,7 +102,7 @@ class PachubeFeedUpdate:
     self._version = "1.0.0"
     self._feed_id = feed_id
     self._opener = mechanize.build_opener()
-    self._opener.addheaders = [('X-PachubeApiKey',apikey)]
+    self._opener.addheaders = [('X-XivelyApiKey',apikey)]
     self._data = []
     self._payload = {}
 
@@ -308,8 +308,8 @@ parser.add_option("-d", "--debug", action="store_true",  dest="debug",
     help="""Debug mode.""")
 parser.add_option("-q", "--quiet", action="store_true", dest="quiet",
     help="""Quiet mode, only print errors. Useful in cron jobs.""")
-parser.add_option("-c", "--cosm", action="store_true", dest="cosm",
-    help="""Submit power values to Cosm/Pachube.""")
+parser.add_option("-c", "--xively", action="store_true", dest="xively",
+    help="""Submit power values to Xively.""")
 parser.add_option("-p", "--plotwatt", action="store_true", dest="plotwatt",
     help="""Submit power values to Plotwatt.""")
 parser.add_option("-o", "--openenergymonitor", action="store_true", dest="oem",
@@ -358,8 +358,8 @@ except (TimeoutException, SerialException) as reason:
     logging.error("Error: %s" % (reason,))
     sys.exit(1)
 
-# Create the cosm datapoint update
-cosmfeedupdate = PachubeFeedUpdate(COSM_FEED_ID, COSM_API_KEY)
+# Create the xively datapoint update
+xivelyfeedupdate = XivelyFeedUpdate(XIVELY_FEED_ID, XIVELY_API_KEY)
 
 # Create the OEM datapoint update
 oemfeedupdate = OEMUpdate(OEM_API_KEY)
@@ -406,13 +406,13 @@ for circle in PLUGWISE_CIRCLES:
 				whlasttime = circletime
 	circle.insert(3,whlast)
 	# add the raw power value to the update datapoints
-	cosmfeedupdate.addDatapoint(description,power)
+	xivelyfeedupdate.addDatapoint(description,power)
 	oemfeedupdate.addDatapoint(description,power)
 	segfeedupdate.addDatapoint(description,power)
 	# also submit Wh data if we have it
 	if whlast != 'Unknown':
 		segfeedupdatewh.addDatapoint(description + '_wh',whlast)
-		cosmfeedupdate.addDatapoint(description + '_wh',whlast)
+		xivelyfeedupdate.addDatapoint(description + '_wh',whlast)
 		oemfeedupdate.addDatapoint(description + '_wh',whlast)
     except ValueError:
 	power = 'Unknown'
@@ -424,11 +424,11 @@ else:
 
 # Now lets's submit to the various webservices
 
-# Cosm/pachube:
-if options.cosm:
-	cosmfeedupdate.buildUpdate()
-	cosmfeedupdate.sendUpdate()
-	logging.info("Submitted values to Cosm")
+# Xively
+if options.xively:
+	xivelyfeedupdate.buildUpdate()
+	xivelyfeedupdate.sendUpdate()
+	logging.info("Submitted values to Xively")
 
 # openenergymonitor
 if options.oem:
